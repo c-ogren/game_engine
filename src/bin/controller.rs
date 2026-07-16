@@ -3,7 +3,13 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
-use std::{env, io::Write, net::TcpStream, time::Duration};
+use std::{
+    env,
+    io::{Read, Write},
+    net::TcpStream,
+    thread,
+    time::Duration,
+};
 
 fn main() -> Result<()> {
     let addr = env::args().nth(1).unwrap_or_else(|| {
@@ -19,6 +25,25 @@ fn main() -> Result<()> {
     println!("Q quits.");
 
     enable_raw_mode()?;
+
+    // Print anything the server sends back (e.g. the entity list) on a
+    // background thread, since the main loop blocks polling for key events.
+    let mut reader = stream
+        .try_clone()
+        .context("failed to clone stream for reader")?;
+    thread::spawn(move || {
+        let mut buf = [0_u8; 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(&buf[..n]);
+                    let _ = out.flush();
+                }
+            }
+        }
+    });
 
     let result = run(&mut stream);
 
@@ -64,7 +89,7 @@ fn run(stream: &mut TcpStream) -> Result<()> {
             }
 
             KeyCode::Char('l') => {
-                stream.write_all(b"list\n")?;
+                stream.write_all(b"l")?;
             }
 
             KeyCode::Char('s') => {

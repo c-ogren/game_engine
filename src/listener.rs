@@ -1,7 +1,7 @@
 use core::str;
-use std::io::Read;
-use std::net::TcpListener;
-use std::sync::mpsc::Sender;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Sender};
 use std::thread;
 
 #[derive(Debug, Clone, Copy)]
@@ -12,12 +12,14 @@ pub enum Direction {
     Right,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum Command {
     Stop(u64),
     Start(u64),
     Move(Direction),
-    List,
+    // Carries a reply channel so the main loop can send the rendered entity
+    // list back to the client that requested it.
+    List(Sender<String>),
 }
 
 pub fn spawn_control_server(tx: Sender<Command>) {
@@ -50,7 +52,7 @@ pub fn handle_client(mut stream: std::net::TcpStream, tx: Sender<Command>) -> st
 
         pending.extend_from_slice(&read_buffer[..bytes_read]);
 
-        while let Some(consumed) = parse_next_input(&pending, &tx) {
+        while let Some(consumed) = parse_next_input(&pending, &tx, &mut stream) {
             pending.drain(..consumed);
         }
     }
@@ -58,7 +60,7 @@ pub fn handle_client(mut stream: std::net::TcpStream, tx: Sender<Command>) -> st
     Ok(())
 }
 
-fn parse_next_input(input: &[u8], tx: &Sender<Command>) -> Option<usize> {
+fn parse_next_input(input: &[u8], tx: &Sender<Command>, stream: &mut TcpStream) -> Option<usize> {
     // Arrow keys commonly arrive as:
     // Up    = ESC [ A
     // Down  = ESC [ B
@@ -87,6 +89,19 @@ fn parse_next_input(input: &[u8], tx: &Sender<Command>) -> Option<usize> {
     // TCP may split an arrow-key sequence across multiple reads.
     if input == b"\x1b" || input == b"\x1b[" {
         return None;
+    }
+
+    // Pressing `l` requests the entity list. Hand the main loop a one-shot
+    // reply channel, wait for the rendered list, then write it back to this
+    // client's connection.
+    if input.starts_with(b"l") {
+        let (reply_tx, reply_rx) = mpsc::channel::<String>();
+        tx.send(Command::List(reply_tx)).ok()?;
+        if let Ok(text) = reply_rx.recv() {
+            let _ = stream.write_all(text.as_bytes());
+            let _ = stream.flush();
+        }
+        return Some(1);
     }
 
     // Keep supporting line-based commands such as:
@@ -121,7 +136,6 @@ fn parse_command(line: &str) -> Option<Command> {
     let command = match parts.next()? {
         "stop" => Command::Stop(parts.next()?.parse().ok()?),
         "start" => Command::Start(parts.next()?.parse().ok()?),
-        "list" => Command::List,
         _ => return None,
     };
 

@@ -16,15 +16,23 @@ const TICK: Duration = Duration::from_nanos(16_666_667); // 60 FPS, 60 Hz
 fn main() {
     let mut world = World::new();
 
+    // Keep the real Entity handles, indexed by command id, so we never have to
+    // fabricate a handle from a raw id (which is unsafe and can silently alias
+    // the wrong entity).
+    let mut entities: Vec<hecs::Entity> = Vec::new();
     for i in 0..10 {
-        world.spawn((
+        let entity = world.spawn((
             Position(Vec2::new(i as f32, 0.0)),
             Velocity(Vec2::new(0.0, 0.0)),
         ));
+        entities.push(entity);
     }
 
     let (tx, rx) = mpsc::channel::<listener::Command>();
     listener::spawn_control_server(tx);
+
+    // When the server came up, so we can report uptime each frame.
+    let start = Instant::now();
 
     let mut last = Instant::now();
     let mut accu = Duration::ZERO;
@@ -49,7 +57,7 @@ fn main() {
         last = now;
 
         while let Ok(cmd) = rx.try_recv() {
-            apply_command(&mut world, cmd);
+            apply_command(&mut world, &entities, cmd);
         }
 
         while accu >= TICK {
@@ -58,11 +66,11 @@ fn main() {
         }
 
         if now - last_render >= render_interval {
-            print_entities(&world, accu, dt);
+            print_entities(&world, start.elapsed(), accu, dt);
             last_render = now;
         }
         // TODO: network snapshot / send happens here.
-        std::thread::sleep(Duration::from_millis(1)); //avoid busy spinning
+        std::thread::sleep(Duration::from_millis(1)); // avoid busy spinning
     }
 }
 
@@ -72,7 +80,7 @@ fn step(world: &mut World, dt: f32) {
     }
 }
 
-fn print_entities(world: &World, accu: Duration, dt: f32) {
+fn print_entities(world: &World, uptime: Duration, accu: Duration, dt: f32) {
     use std::fmt::Write as _;
     use std::io::Write as _;
 
@@ -84,8 +92,9 @@ fn print_entities(world: &World, accu: Duration, dt: f32) {
     let _ = writeln!(buf, "\x1b[KEntities in world:");
     let _ = writeln!(
         buf,
-        "\x1b[KAccumulated time: {:.3} ms, dt: {:.3} ms",
-        accu.as_secs_f32() * 1000.0,
+        "\x1b[KUptime: {:.3} ms, Alpha: {:.3}, dt: {:.3} ms",
+        uptime.as_secs_f32() * 1000.0,
+        accu.as_secs_f32() / TICK.as_secs_f32(),
         dt * 1000.0
     );
 
@@ -101,37 +110,42 @@ fn print_entities(world: &World, accu: Duration, dt: f32) {
     let _ = out.flush();
 }
 
-fn apply_command(world: &mut World, cmd: listener::Command) {
+fn apply_command(world: &mut World, entities: &[hecs::Entity], cmd: listener::Command) {
     match cmd {
         listener::Command::Stop(id) => {
-            let entity = unsafe { world.find_entity_from_id(id.try_into().unwrap()) };
-            if let Ok(mut vel) = world.get::<&mut Velocity>(entity) {
-                vel.0 = glam::Vec2::ZERO;
+            if let Some(&entity) = entities.get(id as usize) {
+                if let Ok(mut vel) = world.get::<&mut Velocity>(entity) {
+                    vel.0 = glam::Vec2::ZERO;
+                }
             }
         }
         listener::Command::Start(id) => {
-            let entity = unsafe { world.find_entity_from_id(id.try_into().unwrap()) };
-            if let Ok(mut vel) = world.get::<&mut Velocity>(entity) {
-                vel.0 = glam::Vec2::new(1.0, 0.5);
+            if let Some(&entity) = entities.get(id as usize) {
+                if let Ok(mut vel) = world.get::<&mut Velocity>(entity) {
+                    vel.0 = glam::Vec2::new(1.0, 0.5);
+                }
             }
         }
-        listener::Command::List => {
-            println!("Listing entities:");
+        listener::Command::List(reply) => {
+            use std::fmt::Write as _;
+            let mut text = String::from("Entities in world:\r\n");
             for (entity, pos) in world.query::<(hecs::Entity, &Position)>().iter() {
-                println!("Entity {:?} Position: {:?}", entity, pos.0);
+                let _ = writeln!(text, "Entity {:?} Position: {:?}\r", entity, pos.0);
             }
+            let _ = reply.send(text);
         }
         listener::Command::Move(dir) => {
-            let entity = unsafe { world.find_entity_from_id(0) }; // Assuming we want to move entity with ID 0
-            if let Ok(mut pos) = world.get::<&mut Position>(entity) {
-                let delta = match dir {
-                    listener::Direction::Up => glam::Vec2::new(0.0, -1.0),
-                    listener::Direction::Down => glam::Vec2::new(0.0, 1.0),
-                    listener::Direction::Left => glam::Vec2::new(-1.0, 0.0),
-                    listener::Direction::Right => glam::Vec2::new(1.0, 0.0),
-                };
+            if let Some(&entity) = entities.first() {
+                if let Ok(mut pos) = world.get::<&mut Position>(entity) {
+                    let delta = match dir {
+                        listener::Direction::Up => glam::Vec2::new(0.0, -1.0),
+                        listener::Direction::Down => glam::Vec2::new(0.0, 1.0),
+                        listener::Direction::Left => glam::Vec2::new(-1.0, 0.0),
+                        listener::Direction::Right => glam::Vec2::new(1.0, 0.0),
+                    };
 
-                pos.0 += delta;
+                    pos.0 += delta;
+                }
             }
         }
     }
