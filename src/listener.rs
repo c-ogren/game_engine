@@ -1,3 +1,4 @@
+use core::str;
 use std::io::Read;
 use std::net::TcpListener;
 use std::sync::mpsc::Sender;
@@ -93,8 +94,8 @@ fn parse_next_input(input: &[u8], tx: &Sender<Command>) -> Option<usize> {
     // stop 4
     // list
     if let Some(newline_index) = input.iter().position(|byte| *byte == b'\n') {
-        let line = &input[..newline_index];
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line: &[u8] = &input[..newline_index];
+        let line: &[u8] = line.strip_suffix(b"\r").unwrap_or(line);
 
         if let Ok(line) = std::str::from_utf8(line)
             && let Some(command) = parse_command(line)
@@ -115,7 +116,7 @@ fn parse_next_input(input: &[u8], tx: &Sender<Command>) -> Option<usize> {
 }
 
 fn parse_command(line: &str) -> Option<Command> {
-    let mut parts = line.split_whitespace();
+    let mut parts: std::str::SplitWhitespace<'_> = line.split_whitespace();
 
     let command = match parts.next()? {
         "stop" => Command::Stop(parts.next()?.parse().ok()?),
