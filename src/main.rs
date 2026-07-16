@@ -30,6 +30,18 @@ fn main() {
     let mut accu = Duration::ZERO;
     let dt = TICK.as_secs_f32();
 
+    // Throttle rendering: the sim can tick fast, but the terminal only needs
+    // to be repainted at a human-visible rate (~60 Hz here).
+    let render_interval = Duration::from_millis(16);
+    let mut last_render = Instant::now();
+
+    // Hide the cursor so it doesn't blink/jump around while we repaint.
+    {
+        use std::io::Write;
+        print!("\x1b[?25l\x1b[2J");
+        std::io::stdout().flush().unwrap();
+    }
+
     loop {
         let now = Instant::now();
 
@@ -45,7 +57,10 @@ fn main() {
             accu -= TICK;
         }
 
-        print_entities(&world, accu, dt);
+        if now - last_render >= render_interval {
+            print_entities(&world, accu, dt);
+            last_render = now;
+        }
         // TODO: network snapshot / send happens here.
         std::thread::sleep(Duration::from_millis(1)); //avoid busy spinning
     }
@@ -58,20 +73,32 @@ fn step(world: &mut World, dt: f32) {
 }
 
 fn print_entities(world: &World, accu: Duration, dt: f32) {
-    use std::io::Write;
-    print!("\x1b[H\x1b[2J");
-    println!("Entities in world:");
-    println!(
-        "Accumulated time: {:.3} ms, dt: {:.3} ms",
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+
+    // Compose the whole frame in memory, then emit it in a single write.
+    // \x1b[H homes the cursor without clearing (no blank frame => no flicker),
+    // \x1b[K clears each line to its end so stale characters don't linger.
+    let mut buf = String::with_capacity(1024);
+    buf.push_str("\x1b[H");
+    let _ = writeln!(buf, "\x1b[KEntities in world:");
+    let _ = writeln!(
+        buf,
+        "\x1b[KAccumulated time: {:.3} ms, dt: {:.3} ms",
         accu.as_secs_f32() * 1000.0,
         dt * 1000.0
     );
 
     for (entity, pos) in world.query::<(hecs::Entity, &Position)>().iter() {
-        println!("\x1b[2KEntity {:?} Position: {:?}\r\n", entity, pos.0);
+        let _ = writeln!(buf, "\x1b[KEntity {:?} Position: {:?}", entity, pos.0);
     }
 
-    std::io::stdout().flush().unwrap();
+    // Clear anything left below the last line (e.g. if the entity count shrank).
+    buf.push_str("\x1b[J");
+
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(buf.as_bytes());
+    let _ = out.flush();
 }
 
 fn apply_command(world: &mut World, cmd: listener::Command) {

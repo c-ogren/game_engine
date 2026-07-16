@@ -1,14 +1,9 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
-use std::{
-    env,
-    io::Write,
-    net::TcpStream,
-    time::Duration,
-};
+use std::{env, io::Write, net::TcpStream, time::Duration};
 
 fn main() -> Result<()> {
     let addr = env::args().nth(1).unwrap_or_else(|| {
@@ -16,8 +11,8 @@ fn main() -> Result<()> {
         std::process::exit(1);
     });
 
-    let mut stream = TcpStream::connect(&addr)
-        .with_context(|| format!("failed to connect to {addr}"))?;
+    let mut stream =
+        TcpStream::connect(&addr).with_context(|| format!("failed to connect to {addr}"))?;
 
     println!("Connected to {addr}");
     println!("Arrow keys move.");
@@ -43,9 +38,7 @@ fn run(stream: &mut TcpStream) -> Result<()> {
         };
 
         // Ignore release events.
-        if key.kind != KeyEventKind::Press
-            && key.kind != KeyEventKind::Repeat
-        {
+        if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
             continue;
         }
 
