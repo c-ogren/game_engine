@@ -1,0 +1,13 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "client"
+path = "src/main.rs"
+
+[dependencies]
+protocol = { path = "../protocol" }
+crossterm = { workspace = true }
+anyhow = { workspace = true }

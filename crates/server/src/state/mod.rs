@@ -1,9 +1,11 @@
 use crate::player::Player;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+/// Tracks connected player sessions. This is a *server* concern (note the
+/// network `address` on each player), not part of the game simulation.
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub players: Arc<RwLock<HashMap<u64, Player>>>,
@@ -27,8 +29,7 @@ impl AppState {
     pub fn add_player(&self, player: Player) -> u64 {
         let mut players = self.players.write().unwrap();
         players.insert(player.id, player);
-        self.id_counter
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        self.id_counter.fetch_add(1, Ordering::SeqCst)
     }
 
     pub fn remove_player(&self, player_addr: &str) {
@@ -37,7 +38,7 @@ impl AppState {
     }
 
     pub fn get_counter(&self) -> u64 {
-        self.id_counter.load(std::sync::atomic::Ordering::SeqCst)
+        self.id_counter.load(Ordering::SeqCst)
     }
 
     pub fn get_players(&self) -> HashMap<u64, Player> {

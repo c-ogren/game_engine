@@ -1,0 +1,9 @@
+[package]
+name = "game-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+protocol = { path = "../protocol" }
+glam = { workspace = true }
+hecs = { workspace = true }
