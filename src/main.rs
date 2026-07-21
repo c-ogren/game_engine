@@ -3,7 +3,8 @@ use hecs::World;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-pub mod listener;
+use game_engine::listener;
+use game_engine::state::AppState;
 
 // -- Components
 #[derive(Clone, Copy)]
@@ -12,6 +13,8 @@ struct Position(Vec2);
 struct Velocity(Vec2);
 
 const TICK: Duration = Duration::from_nanos(16_666_667); // 60 FPS, 60 Hz
+const UDP_SERVER_ADDR: &str = "127.0.0.1:9001";
+const TCP_SERVER_ADDR: &str = "127.0.0.1:9000"; // TODO: unused, but we could add a TCP control server in parallel to the UDP one.
 
 fn main() {
     let mut world = World::new();
@@ -29,7 +32,9 @@ fn main() {
     }
 
     let (tx, rx) = mpsc::channel::<listener::Command>();
-    listener::spawn_control_server(tx);
+    let app_state = AppState::new();
+    listener::spawn_udp_control_server(UDP_SERVER_ADDR, tx.clone());
+    listener::spawn_tcp_control_server(TCP_SERVER_ADDR, tx, app_state.clone());
 
     // When the server came up, so we can report uptime each frame.
     let start = Instant::now();
@@ -66,7 +71,7 @@ fn main() {
         }
 
         if now - last_render >= render_interval {
-            print_entities(&world, start.elapsed(), accu, dt);
+            print_entities(&world, start.elapsed(), accu, dt, &app_state);
             last_render = now;
         }
         // TODO: network snapshot / send happens here.
@@ -80,7 +85,7 @@ fn step(world: &mut World, dt: f32) {
     }
 }
 
-fn print_entities(world: &World, uptime: Duration, accu: Duration, dt: f32) {
+fn print_entities(world: &World, uptime: Duration, accu: Duration, dt: f32, app_state: &AppState) {
     use std::fmt::Write as _;
     use std::io::Write as _;
 
@@ -89,6 +94,11 @@ fn print_entities(world: &World, uptime: Duration, accu: Duration, dt: f32) {
     // \x1b[K clears each line to its end so stale characters don't linger.
     let mut buf = String::with_capacity(1024);
     buf.push_str("\x1b[H");
+    let _ = writeln!(
+        buf,
+        "\x1b[KControl server listening on TCP {} and UDP {}",
+        TCP_SERVER_ADDR, UDP_SERVER_ADDR
+    );
     let _ = writeln!(buf, "\x1b[KEntities in world:");
     let _ = writeln!(
         buf,
@@ -100,6 +110,10 @@ fn print_entities(world: &World, uptime: Duration, accu: Duration, dt: f32) {
 
     for (entity, pos) in world.query::<(hecs::Entity, &Position)>().iter() {
         let _ = writeln!(buf, "\x1b[KEntity {:?} Position: {:?}", entity, pos.0);
+    }
+
+    for (id, player) in app_state.get_players() {
+        let _ = writeln!(buf, "\x1b[KPlayer {}: {:?}", id, player);
     }
 
     // Clear anything left below the last line (e.g. if the entity count shrank).
@@ -126,13 +140,12 @@ fn apply_command(world: &mut World, entities: &[hecs::Entity], cmd: listener::Co
                 }
             }
         }
-        listener::Command::List(reply) => {
-            use std::fmt::Write as _;
-            let mut text = String::from("Entities in world:\r\n");
-            for (entity, pos) in world.query::<(hecs::Entity, &Position)>().iter() {
-                let _ = writeln!(text, "Entity {:?} Position: {:?}\r", entity, pos.0);
-            }
-            let _ = reply.send(text);
+        listener::Command::Ack((reply, id)) => {
+            reply
+                .send(format!("ACK {id}").to_string())
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to send ACK: {e}");
+                });
         }
         listener::Command::Move(dir) => {
             if let Some(&entity) = entities.first() {
