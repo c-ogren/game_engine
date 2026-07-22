@@ -13,27 +13,31 @@ pub struct Position(pub Vec2);
 #[derive(Clone, Copy, Debug)]
 pub struct Velocity(pub Vec2);
 
-/// The simulated world plus stable handles to the entities we spawned.
+/// Marks an entity as a connected player and carries its display name.
+/// Networking details (addresses, sockets) deliberately live outside the ECS,
+/// in the server's session registry.
+#[derive(Clone, Debug)]
+pub struct Player {
+    pub name: String,
+}
+
+/// The simulated world. The game loop is its sole owner, so no locking is needed;
+/// Network threads mutate it only by sending commands to the loop.
 pub struct Game {
     pub world: World,
-    /// Entity handles indexed by command id, so callers never fabricate a
-    /// handle from a raw id (which is unsafe and can silently alias the wrong
-    /// entity).
-    pub entities: Vec<Entity>,
 }
 
 impl Game {
-    /// Spawn `entity_count` entities laid out along the x axis, at rest.
-    pub fn new(entity_count: usize) -> Self {
+    /// Spawn `scenery_count` static demo entities. Players are added later,
+    /// once they connect, via [`Game::spawn_player`].
+    pub fn new(scenery_count: usize) -> Self {
         let mut world = World::new();
-        let mut entities = Vec::with_capacity(entity_count);
 
-        for i in 0..entity_count {
-            let entity = world.spawn((Position(Vec2::new(i as f32, 0.0)), Velocity(Vec2::ZERO)));
-            entities.push(entity);
+        for i in 0..scenery_count {
+            world.spawn((Position(Vec2::new(i as f32, 0.0)), Velocity(Vec2::ZERO)));
         }
 
-        Self { world, entities }
+        Self { world }
     }
 
     /// Advance the simulation by one fixed timestep.
@@ -43,32 +47,37 @@ impl Game {
         }
     }
 
-    /// Nudge the first entity one unit in the given direction.
-    pub fn move_entity(&mut self, direction: Direction) {
-        let Some(&entity) = self.entities.first() else {
-            return;
-        };
+    /// Spawn a player entity and return its handle. The caller (a connection
+    /// handler) owns this handle for the lifetime of the session and uses it
+    /// to target subsequent commands.
+    pub fn spawn_player(&mut self, name: String) -> Entity {
+        self.world
+            .spawn((Player { name }, Position(Vec2::ZERO), Velocity(Vec2::ZERO)))
+    }
 
+    /// Despawn a player entity (e.g. on disconnect).
+    pub fn despawn_player(&mut self, entity: Entity) {
+        let _ = self.world.despawn(entity);
+    }
+
+    /// Nudge a specific entity one unit in the given direction.
+    pub fn move_entity(&mut self, entity: Entity, direction: Direction) {
         if let Ok(mut position) = self.world.get::<&mut Position>(entity) {
             position.0 += direction_delta(direction);
         }
     }
 
-    /// Give the entity with `id` a nonzero velocity.
-    pub fn start(&mut self, id: u64) {
-        self.set_velocity(id, Vec2::new(1.0, 0.5));
+    /// Give an entity a nonzero velocity so it drifts each step.
+    pub fn start(&mut self, entity: Entity) {
+        self.set_velocity(entity, Vec2::new(1.0, 0.5));
     }
 
-    /// Zero the velocity of the entity with `id`.
-    pub fn stop(&mut self, id: u64) {
-        self.set_velocity(id, Vec2::ZERO);
+    /// Zero an entity's velocity.
+    pub fn stop(&mut self, entity: Entity) {
+        self.set_velocity(entity, Vec2::ZERO);
     }
 
-    fn set_velocity(&mut self, id: u64, value: Vec2) {
-        let Some(&entity) = self.entities.get(id as usize) else {
-            return;
-        };
-
+    fn set_velocity(&mut self, entity: Entity, value: Vec2) {
         if let Ok(mut velocity) = self.world.get::<&mut Velocity>(entity) {
             velocity.0 = value;
         }

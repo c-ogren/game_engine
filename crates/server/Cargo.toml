@@ -12,3 +12,5 @@ game-core = { path = "../game-core" }
 protocol = { path = "../protocol" }
 hecs = { workspace = true }
 anyhow = { workspace = true }
+log = { workspace = true }
+simplelog = { workspace = true }
