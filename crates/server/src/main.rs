@@ -3,10 +3,12 @@ mod listener;
 mod state;
 use config::Config;
 
+use std::net::UdpSocket;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use game_core::{Game, Player, Position};
+use protocol::ServerMessage;
 
 use crate::listener::{Command, spawn_tcp_control_server, spawn_udp_control_server};
 use crate::state::AppState;
@@ -29,7 +31,26 @@ fn main() {
 
     let (tx, rx) = mpsc::channel::<Command>();
     let app_state = AppState::new();
-    spawn_udp_control_server(udp_server_addr, tx.clone(), app_state.clone());
+
+    // Bind the UDP socket up front and share it: the listener thread receives on
+    // one clone while the game loop sends per-tick snapshots on another. Both
+    // clones refer to the same underlying socket.
+    let udp_socket = match UdpSocket::bind(&udp_server_addr) {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("failed to bind UDP server to {udp_server_addr}: {error}");
+            std::process::exit(1);
+        }
+    };
+    let listener_socket = match udp_socket.try_clone() {
+        Ok(socket) => socket,
+        Err(error) => {
+            eprintln!("failed to clone UDP socket: {error}");
+            std::process::exit(1);
+        }
+    };
+
+    spawn_udp_control_server(listener_socket, tx.clone(), app_state.clone());
     spawn_tcp_control_server(tcp_server_addr, tx, app_state.clone());
 
     // When the server came up, so we can report uptime each frame.
@@ -44,12 +65,9 @@ fn main() {
     let render_interval = Duration::from_millis(16);
     let mut last_render = Instant::now();
 
-    // Hide the cursor so it doesn't blink/jump around while we repaint.
-    {
-        use std::io::Write;
-        print!("\x1b[?25l\x1b[2J");
-        std::io::stdout().flush().unwrap();
-    }
+    // Hide the cursor so it doesn't blink/jump around while we repaint, and
+    // clear the screen once before the first frame.
+    render::enter();
 
     loop {
         let now = Instant::now();
@@ -61,9 +79,17 @@ fn main() {
             apply_command(&mut game, command);
         }
 
+        let mut ticked = false;
         while accu >= tick_rate {
             game.step(dt);
             accu -= tick_rate;
+            ticked = true;
+        }
+
+        // Every tick that advanced the world, push a fresh snapshot to every
+        // subscribed client over UDP.
+        if ticked {
+            broadcast_snapshot(&game, &udp_socket, &app_state);
         }
 
         if now - last_render >= render_interval {
@@ -71,9 +97,26 @@ fn main() {
             last_render = now;
         }
 
-        // TODO: network snapshot / send happens here.
-
         std::thread::sleep(Duration::from_millis(1)); // avoid busy spinning
+    }
+}
+
+/// Serialize the world and send it to every UDP subscriber.
+fn broadcast_snapshot(game: &Game, socket: &UdpSocket, app_state: &AppState) {
+    let subscribers = app_state.subscribers();
+    if subscribers.is_empty() {
+        return;
+    }
+
+    let message = ServerMessage::Snapshot {
+        entities: game.snapshot(),
+    };
+    let bytes = message.encode();
+
+    for address in subscribers {
+        if let Err(error) = socket.send_to(bytes.as_bytes(), address) {
+            log::warn!("failed to send snapshot to {address}: {error}");
+        }
     }
 }
 
@@ -105,8 +148,6 @@ fn init_logging() -> anyhow::Result<()> {
 }
 
 fn print_state(game: &Game, uptime: Duration, accu: Duration, dt: f32, app_state: &AppState) {
-    use std::fmt::Write as _;
-    use std::io::Write as _;
     let Config {
         tcp_server_addr,
         udp_server_addr,
@@ -114,23 +155,19 @@ fn print_state(game: &Game, uptime: Duration, accu: Duration, dt: f32, app_state
         ..
     } = Config::from_env();
 
-    // Compose the whole frame in memory, then emit it in a single write.
-    // \x1b[H homes the cursor without clearing (no blank frame => no flicker),
-    // \x1b[K clears each line to its end so stale characters don't linger.
-    let mut buf = String::with_capacity(1024);
-    buf.push_str("\x1b[H");
-    let _ = writeln!(
-        buf,
-        "\x1b[KControl server listening on TCP {tcp_server_addr} and UDP {udp_server_addr}"
-    );
-    let _ = writeln!(
-        buf,
-        "\x1b[KUptime: {:.3} ms, Alpha: {:.3}, dt: {:.3} ms",
+    // Build the frame as a list of lines; `render::paint` handles the in-place
+    // repaint (cursor home, per-line clear, clear-below, single write).
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Control server listening on TCP {tcp_server_addr} and UDP {udp_server_addr}"
+    ));
+    lines.push(format!(
+        "Uptime: {:.3} ms, Alpha: {:.3}, dt: {:.3} ms",
         uptime.as_secs_f32() * 1000.0,
         accu.as_secs_f32() / tick_rate.as_secs_f32(),
         dt * 1000.0
-    );
-    let _ = writeln!(buf, "\x1b[KEntities in world:");
+    ));
+    lines.push("Entities in world:".to_owned());
 
     // Players carry a `Player` component; scenery entities don't.
     for (entity, position, player) in game
@@ -139,36 +176,31 @@ fn print_state(game: &Game, uptime: Duration, accu: Duration, dt: f32, app_state
         .iter()
     {
         match player {
-            Some(player) => {
-                let _ = writeln!(
-                    buf,
-                    "\x1b[KPlayer {} ({}) Position: {:?}",
-                    entity.id(),
-                    player.name,
-                    position.0
-                );
-            }
-            None => {
-                let _ = writeln!(buf, "\x1b[KEntity {entity:?} Position: {:?}", position.0);
-            }
+            Some(player) => lines.push(format!(
+                "Player {} ({}) Position: {:?}",
+                entity.id(),
+                player.name,
+                position.0
+            )),
+            None => lines.push(format!("Entity {entity:?} Position: {:?}", position.0)),
         }
     }
 
-    let _ = writeln!(buf, "\x1b[KSessions (networking):");
+    lines.push("Sessions (networking):".to_owned());
     for session in app_state.sessions() {
-        let _ = writeln!(
-            buf,
-            "\x1b[KSession {} at {} -> entity {}",
+        let udp = session
+            .udp_address
+            .map(|address| address.to_string())
+            .unwrap_or_else(|| "unsubscribed".to_owned());
+        lines.push(format!(
+            "Session {} (token {}) TCP {} UDP {} -> entity {}",
             session.id,
-            session.address,
+            session.token,
+            session.tcp_address,
+            udp,
             session.entity.id()
-        );
+        ));
     }
 
-    // Clear anything left below the last line (e.g. if the entity count shrank).
-    buf.push_str("\x1b[J");
-
-    let mut out = std::io::stdout().lock();
-    let _ = out.write_all(buf.as_bytes());
-    let _ = out.flush();
+    render::paint(&lines);
 }

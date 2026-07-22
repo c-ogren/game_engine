@@ -5,7 +5,7 @@
 
 use glam::Vec2;
 use hecs::{Entity, World};
-use protocol::Direction;
+use protocol::{Direction, EntitySnapshot};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Position(pub Vec2);
@@ -45,6 +45,21 @@ impl Game {
         for (position, velocity) in self.world.query_mut::<(&mut Position, &Velocity)>() {
             position.0 += velocity.0 * dt;
         }
+    }
+
+    /// Capture the current position of every entity for a network snapshot.
+    /// Entities are keyed by their `hecs` id, which is stable for an entity's
+    /// lifetime and is what the client uses to correlate updates across ticks.
+    pub fn snapshot(&self) -> Vec<EntitySnapshot> {
+        self.world
+            .query::<(hecs::Entity, &Position)>()
+            .iter()
+            .map(|(entity, position)| EntitySnapshot {
+                id: entity.id() as u64,
+                x: position.0.x,
+                y: position.0.y,
+            })
+            .collect()
     }
 
     /// Spawn a player entity and return its handle. The caller (a connection

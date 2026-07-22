@@ -27,6 +27,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "protocol",
+ "render",
 ]
 
 [[package]]
@@ -280,6 +281,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "render"
+version = "0.1.0"
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -343,6 +348,7 @@ dependencies = [
  "hecs",
  "log",
  "protocol",
+ "render",
  "simplelog",
 ]
 

@@ -1,6 +1,11 @@
-//! TCP control server: reliable, connection-oriented transport used for
-//! session lifecycle (join/quit) as well as gameplay commands. Each connection
-//! owns exactly one player entity for its lifetime.
+//! TCP control server: reliable, connection-oriented transport used *only* for
+//! the session lifecycle (join/quit). Each connection owns exactly one player
+//! entity for its lifetime. Gameplay commands (movement) travel over UDP; see
+//! the `udp` sibling module.
+//!
+//! Join hands the client a session token in the `Ack`. The client echoes that
+//! token on its UDP datagrams so the connectionless transport can be routed
+//! back to this session's entity.
 
 use super::Command;
 use crate::state::AppState;
@@ -137,19 +142,17 @@ fn handle_line(
             // Session teardown happens in `handle_connection` once we return.
             return Ok(ControlFlow::Break(()));
         }
-        // Gameplay commands target this connection's own player entity, so a
-        // client can only ever move itself.
-        ClientMessage::Move(direction) => {
-            forward(stream, tx, player, |entity| Command::Move {
-                entity,
-                dir: direction,
-            })?;
-        }
-        ClientMessage::Start(_) => {
-            forward(stream, tx, player, |entity| Command::Start { entity })?;
-        }
-        ClientMessage::Stop(_) => {
-            forward(stream, tx, player, |entity| Command::Stop { entity })?;
+        // Gameplay and subscription traffic belong to UDP. Reject them here so
+        // TCP stays strictly a session-lifecycle channel.
+        ClientMessage::Hello { .. }
+        | ClientMessage::Move { .. }
+        | ClientMessage::Start { .. }
+        | ClientMessage::Stop { .. }
+        | ClientMessage::Ping { .. } => {
+            respond(
+                stream,
+                &ServerMessage::Error("gameplay commands require UDP".to_owned()),
+            )?;
         }
     }
 
@@ -193,32 +196,15 @@ fn join(
 
     match reply_rx.recv_timeout(Duration::from_secs(2)) {
         Ok(entity) => {
-            let id = app_state.register(peer.to_owned(), entity);
+            let (id, token) = app_state.register(peer.to_owned(), entity);
             *player = Some(entity);
             log::info!("player {id} ({name}) joined from {peer}");
-            respond(stream, &ServerMessage::Ack { id })
+            respond(stream, &ServerMessage::Ack { id, token })
         }
         Err(error) => {
             log::warn!("timed out waiting for game-loop spawn for {peer}: {error}");
             respond(stream, &ServerMessage::Error("spawn timeout".to_owned()))
         }
-    }
-}
-
-/// Forward a gameplay command for this connection's player, or tell the client
-/// to join first if it hasn't.
-fn forward(
-    stream: &mut TcpStream,
-    tx: &Sender<Command>,
-    player: &Option<Entity>,
-    make_command: impl FnOnce(Entity) -> Command,
-) -> Result<()> {
-    match *player {
-        Some(entity) => {
-            let _ = tx.send(make_command(entity));
-            Ok(())
-        }
-        None => respond(stream, &ServerMessage::Error("join first".to_owned())),
     }
 }
 

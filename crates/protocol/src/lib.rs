@@ -4,11 +4,24 @@
 //! line *without* a trailing newline; framing is the transport's job (a
 //! trailing `\n` for TCP streams, one datagram per message for UDP).
 //!
+//! Transports are split by responsibility:
+//!
+//! * **TCP** owns the session lifecycle: [`ClientMessage::Join`] /
+//!   [`ClientMessage::Quit`], answered with [`ServerMessage::Ack`] (which hands
+//!   the client a session *token*).
+//! * **UDP** owns fast gameplay traffic: the client subscribes with
+//!   [`ClientMessage::Hello`] and then streams [`ClientMessage::Move`] /
+//!   [`ClientMessage::Start`] / [`ClientMessage::Stop`], each tagged with its
+//!   token so the server can route it without relying on the source address.
+//!   The server pushes [`ServerMessage::Snapshot`] world updates back over the
+//!   same channel.
+//!
 //! This crate is intentionally dependency-free and contains only plain data
 //! plus (de)serialization, so both the client and server can depend on it
 //! without pulling in networking, ECS, or terminal concerns.
 
 use std::fmt;
+use std::fmt::Write as _;
 use std::str::FromStr;
 
 /// A movement direction.
@@ -51,19 +64,30 @@ impl FromStr for Direction {
     }
 }
 
+/// A session token, minted by the server at join time and echoed by the client
+/// on every UDP datagram so the server can map connectionless packets back to a
+/// session (and thus a game-world entity) without trusting the source address.
+pub type Token = u64;
+
 /// A message sent from a client to the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientMessage {
-    /// Register a new player session.
+    /// Register a new player session. **TCP only.**
     Join { name: String },
-    /// Nudge the controlled entity in a direction.
-    Move(Direction),
-    /// Give the entity with this id a velocity.
-    Start(u64),
-    /// Zero the velocity of the entity with this id.
-    Stop(u64),
-    /// End the session.
+    /// End the session. **TCP only.**
     Quit,
+    /// Announce this client's UDP address for a session, subscribing it to
+    /// world snapshots. **UDP only.**
+    Hello { token: Token },
+    /// Nudge the controlled entity in a direction. **UDP only.**
+    Move { token: Token, dir: Direction },
+    /// Give the controlled entity a velocity. **UDP only.**
+    Start { token: Token },
+    /// Zero the controlled entity's velocity. **UDP only.**
+    Stop { token: Token },
+    /// Round-trip probe for latency. The server echoes `nonce` back in a
+    /// [`ServerMessage::Pong`]; the client measures RTT on receipt. **UDP only.**
+    Ping { token: Token, nonce: u64 },
 }
 
 impl ClientMessage {
@@ -71,10 +95,12 @@ impl ClientMessage {
     pub fn encode(&self) -> String {
         match self {
             ClientMessage::Join { name } => format!("join {name}"),
-            ClientMessage::Move(direction) => format!("move {direction}"),
-            ClientMessage::Start(id) => format!("start {id}"),
-            ClientMessage::Stop(id) => format!("stop {id}"),
             ClientMessage::Quit => "quit".to_owned(),
+            ClientMessage::Hello { token } => format!("hello {token}"),
+            ClientMessage::Move { token, dir } => format!("move {token} {dir}"),
+            ClientMessage::Start { token } => format!("start {token}"),
+            ClientMessage::Stop { token } => format!("stop {token}"),
+            ClientMessage::Ping { token, nonce } => format!("ping {token} {nonce}"),
         }
     }
 
@@ -91,16 +117,28 @@ impl ClientMessage {
                     name: name.to_owned(),
                 }
             }
+            "quit" => ClientMessage::Quit,
+            "hello" => ClientMessage::Hello {
+                token: parse_u64(parts.next(), "token")?,
+            },
             "move" => {
-                let direction = parts
+                let token = parse_u64(parts.next(), "token")?;
+                let dir = parts
                     .next()
                     .ok_or(ProtocolError::MissingArgument("direction"))?
                     .parse()?;
-                ClientMessage::Move(direction)
+                ClientMessage::Move { token, dir }
             }
-            "start" => ClientMessage::Start(parse_id(parts.next())?),
-            "stop" => ClientMessage::Stop(parse_id(parts.next())?),
-            "quit" => ClientMessage::Quit,
+            "start" => ClientMessage::Start {
+                token: parse_u64(parts.next(), "token")?,
+            },
+            "stop" => ClientMessage::Stop {
+                token: parse_u64(parts.next(), "token")?,
+            },
+            "ping" => ClientMessage::Ping {
+                token: parse_u64(parts.next(), "token")?,
+                nonce: parse_u64(parts.next(), "nonce")?,
+            },
             other => return Err(ProtocolError::UnknownCommand(other.to_owned())),
         };
 
@@ -108,13 +146,54 @@ impl ClientMessage {
     }
 }
 
+/// The position of a single entity within a world snapshot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntitySnapshot {
+    pub id: u64,
+    pub x: f32,
+    pub y: f32,
+}
+
+impl EntitySnapshot {
+    /// Encode as `id:x,y` (no surrounding whitespace).
+    fn encode(&self) -> String {
+        format!("{}:{},{}", self.id, self.x, self.y)
+    }
+
+    /// Parse an `id:x,y` token.
+    fn parse(token: &str) -> Result<Self, ProtocolError> {
+        let (id, rest) = token
+            .split_once(':')
+            .ok_or(ProtocolError::InvalidArgument("snapshot entry"))?;
+        let (x, y) = rest
+            .split_once(',')
+            .ok_or(ProtocolError::InvalidArgument("snapshot entry"))?;
+        Ok(EntitySnapshot {
+            id: id
+                .parse()
+                .map_err(|_| ProtocolError::InvalidArgument("snapshot id"))?,
+            x: x.parse()
+                .map_err(|_| ProtocolError::InvalidArgument("snapshot x"))?,
+            y: y.parse()
+                .map_err(|_| ProtocolError::InvalidArgument("snapshot y"))?,
+        })
+    }
+}
+
 /// A message sent from the server back to a client.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ServerMessage {
     /// Command accepted.
     Ok,
-    /// A join was acknowledged; carries the assigned player id.
-    Ack { id: u64 },
+    /// A join was acknowledged; carries the assigned player id and the session
+    /// token the client must echo on UDP traffic.
+    Ack { id: u64, token: Token },
+    /// A world update: every entity's current position. Pushed over UDP each
+    /// tick to subscribed clients.
+    Snapshot { entities: Vec<EntitySnapshot> },
+    /// Reply to a [`ClientMessage::Ping`], echoing its `nonce` so the client
+    /// can compute round-trip latency. **UDP only.**
+    Pong { nonce: u64 },
     /// Something went wrong; carries a human-readable reason.
     Error(String),
 }
@@ -124,7 +203,16 @@ impl ServerMessage {
     pub fn encode(&self) -> String {
         match self {
             ServerMessage::Ok => "ok".to_owned(),
-            ServerMessage::Ack { id } => format!("ack {id}"),
+            ServerMessage::Ack { id, token } => format!("ack {id} {token}"),
+            ServerMessage::Snapshot { entities } => {
+                let mut line = String::from("snapshot");
+                for entity in entities {
+                    // Safe: writing into a String is infallible.
+                    let _ = write!(line, " {}", entity.encode());
+                }
+                line
+            }
+            ServerMessage::Pong { nonce } => format!("pong {nonce}"),
             ServerMessage::Error(message) => format!("error {message}"),
         }
     }
@@ -138,7 +226,17 @@ impl ServerMessage {
         let message = match verb {
             "ok" => ServerMessage::Ok,
             "ack" => ServerMessage::Ack {
-                id: parse_id(parts.next())?,
+                id: parse_u64(parts.next(), "id")?,
+                token: parse_u64(parts.next(), "token")?,
+            },
+            "snapshot" => {
+                let entities = parts
+                    .map(EntitySnapshot::parse)
+                    .collect::<Result<Vec<_>, _>>()?;
+                ServerMessage::Snapshot { entities }
+            }
+            "pong" => ServerMessage::Pong {
+                nonce: parse_u64(parts.next(), "nonce")?,
             },
             "error" => {
                 // Everything after the "error" verb is the reason.
@@ -152,11 +250,11 @@ impl ServerMessage {
     }
 }
 
-fn parse_id(token: Option<&str>) -> Result<u64, ProtocolError> {
+fn parse_u64(token: Option<&str>, name: &'static str) -> Result<u64, ProtocolError> {
     token
-        .ok_or(ProtocolError::MissingArgument("id"))?
+        .ok_or(ProtocolError::MissingArgument(name))?
         .parse::<u64>()
-        .map_err(|_| ProtocolError::InvalidArgument("id"))
+        .map_err(|_| ProtocolError::InvalidArgument(name))
 }
 
 /// Errors produced while decoding a protocol message.
@@ -195,11 +293,18 @@ mod tests {
             ClientMessage::Join {
                 name: "alice".to_owned(),
             },
-            ClientMessage::Move(Direction::Up),
-            ClientMessage::Move(Direction::Left),
-            ClientMessage::Start(3),
-            ClientMessage::Stop(7),
             ClientMessage::Quit,
+            ClientMessage::Hello { token: 99 },
+            ClientMessage::Move {
+                token: 12,
+                dir: Direction::Up,
+            },
+            ClientMessage::Move {
+                token: 12,
+                dir: Direction::Left,
+            },
+            ClientMessage::Start { token: 3 },
+            ClientMessage::Stop { token: 7 },
         ];
 
         for message in messages {
@@ -212,7 +317,21 @@ mod tests {
     fn server_messages_round_trip() {
         let messages = [
             ServerMessage::Ok,
-            ServerMessage::Ack { id: 42 },
+            ServerMessage::Ack { id: 42, token: 777 },
+            ServerMessage::Snapshot {
+                entities: vec![
+                    EntitySnapshot {
+                        id: 1,
+                        x: 0.0,
+                        y: 0.0,
+                    },
+                    EntitySnapshot {
+                        id: 2,
+                        x: 1.5,
+                        y: -3.0,
+                    },
+                ],
+            },
             ServerMessage::Error("username required".to_owned()),
         ];
 
@@ -220,6 +339,12 @@ mod tests {
             let encoded = message.encode();
             assert_eq!(ServerMessage::decode(&encoded).unwrap(), message);
         }
+    }
+
+    #[test]
+    fn empty_snapshot_round_trips() {
+        let message = ServerMessage::Snapshot { entities: vec![] };
+        assert_eq!(ServerMessage::decode(&message.encode()).unwrap(), message);
     }
 
     #[test]

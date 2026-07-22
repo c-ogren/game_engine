@@ -9,5 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 protocol = { path = "../protocol" }
+render = { path = "../render" }
 crossterm = { workspace = true }
 anyhow = { workspace = true }

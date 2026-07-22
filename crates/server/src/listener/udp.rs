@@ -1,29 +1,39 @@
-//! UDP control server: connectionless, low-latency transport for gameplay
-//! commands. Each datagram carries exactly one message, so no framing is
-//! needed. Session commands (join/quit) are rejected here.
+//! UDP control server: connectionless, low-latency transport for gameplay.
+//! Each datagram carries exactly one message, so no framing is needed.
+//!
+//! This is the *only* channel for movement. A client first announces itself
+//! with `Hello { token }` (the token was minted over TCP at join), which both
+//! subscribes its address to world snapshots and lets the server route its
+//! subsequent `Move`/`Start`/`Stop` datagrams to the right entity. Session
+//! commands (join/quit) are rejected here — those belong to TCP.
 
 use super::Command;
 use crate::state::AppState;
 use anyhow::{Context, Result};
 use hecs::Entity;
-use protocol::{ClientMessage, ServerMessage};
+use protocol::{ClientMessage, ServerMessage, Token};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::mpsc::Sender;
 use std::thread;
 
-pub fn spawn_udp_control_server(server_addr: String, tx: Sender<Command>, app_state: AppState) {
+/// Spawn the UDP receive loop on `socket`. The socket is expected to be bound
+/// already; the caller keeps a clone for sending snapshots.
+pub fn spawn_udp_control_server(socket: UdpSocket, tx: Sender<Command>, app_state: AppState) {
     thread::spawn(move || {
-        if let Err(error) = run(&server_addr, tx, app_state) {
+        if let Err(error) = run(socket, tx, app_state) {
             log::error!("UDP control server stopped: {error:#}");
         }
     });
 }
 
-fn run(server_addr: &str, tx: Sender<Command>, app_state: AppState) -> Result<()> {
-    let socket = UdpSocket::bind(server_addr)
-        .with_context(|| format!("failed to bind UDP server to {server_addr}"))?;
-
-    log::info!("UDP control server listening on {server_addr}");
+fn run(socket: UdpSocket, tx: Sender<Command>, app_state: AppState) -> Result<()> {
+    log::info!(
+        "UDP control server listening on {}",
+        socket
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "?".to_owned())
+    );
 
     let mut buffer = [0u8; 1024];
 
@@ -52,46 +62,84 @@ fn handle_packet(
 ) -> Result<()> {
     let line = std::str::from_utf8(packet).context("packet was not valid UTF-8")?;
 
-    let response = match ClientMessage::decode(line) {
-        Ok(ClientMessage::Move(direction)) => {
-            control(app_state, client_addr, tx, |entity| Command::Move {
-                entity,
-                dir: direction,
-            })
+    // Movement is fire-and-forget: on success we send nothing back (the world
+    // snapshot pushed each tick is the client's feedback), which keeps the hot
+    // path cheap. We only reply when there's an error the client should see, or
+    // to acknowledge a subscription.
+    match ClientMessage::decode(line) {
+        Ok(ClientMessage::Hello { token }) => {
+            if app_state.set_udp_address(token, client_addr) {
+                log::info!("UDP subscription from {client_addr} (token {token})");
+                reply(socket, client_addr, &ServerMessage::Ok);
+            } else {
+                reply(
+                    socket,
+                    client_addr,
+                    &ServerMessage::Error("unknown token; join over TCP first".to_owned()),
+                );
+            }
         }
-        Ok(ClientMessage::Start(_)) => control(app_state, client_addr, tx, |entity| {
-            Command::Start { entity }
-        }),
-        Ok(ClientMessage::Stop(_)) => control(app_state, client_addr, tx, |entity| Command::Stop {
-            entity,
-        }),
+        Ok(ClientMessage::Move { token, dir }) => {
+            forward(app_state, token, client_addr, socket, tx, |entity| {
+                Command::Move { entity, dir }
+            });
+        }
+        Ok(ClientMessage::Start { token }) => {
+            forward(app_state, token, client_addr, socket, tx, |entity| {
+                Command::Start { entity }
+            });
+        }
+        Ok(ClientMessage::Stop { token }) => {
+            forward(app_state, token, client_addr, socket, tx, |entity| {
+                Command::Stop { entity }
+            });
+        }
+        Ok(ClientMessage::Ping { nonce, .. }) => {
+            // Pure round-trip echo; no session state involved, so we reply to
+            // the sender regardless of token.
+            reply(socket, client_addr, &ServerMessage::Pong { nonce });
+        }
         Ok(ClientMessage::Join { .. } | ClientMessage::Quit) => {
-            ServerMessage::Error("session commands require TCP".to_owned())
+            reply(
+                socket,
+                client_addr,
+                &ServerMessage::Error("session commands require TCP".to_owned()),
+            );
         }
-        Err(error) => ServerMessage::Error(error.to_string()),
-    };
+        Err(error) => reply(
+            socket,
+            client_addr,
+            &ServerMessage::Error(error.to_string()),
+        ),
+    }
 
-    socket.send_to(response.encode().as_bytes(), client_addr)?;
     Ok(())
 }
 
-/// Resolve the entity controlled by `client_addr` and forward a command for it.
-///
-/// NOTE: a client's UDP source port differs from its TCP port, so this only
-/// matches if the same address:port joined over TCP. Real per-player UDP would
-/// carry a session token issued at join time rather than relying on the source
-/// address; that's a future enhancement.
-fn control(
+/// Resolve the entity for a session `token` and forward a command for it.
+/// Success is silent; an unknown token gets an error datagram back.
+fn forward(
     app_state: &AppState,
+    token: Token,
     client_addr: SocketAddr,
+    socket: &UdpSocket,
     tx: &Sender<Command>,
     make_command: impl FnOnce(Entity) -> Command,
-) -> ServerMessage {
-    match app_state.entity_for_address(&client_addr.to_string()) {
+) {
+    match app_state.entity_for_token(token) {
         Some(entity) => {
             let _ = tx.send(make_command(entity));
-            ServerMessage::Ok
         }
-        None => ServerMessage::Error("no session; join over TCP first".to_owned()),
+        None => reply(
+            socket,
+            client_addr,
+            &ServerMessage::Error("unknown token; join over TCP first".to_owned()),
+        ),
+    }
+}
+
+fn reply(socket: &UdpSocket, client_addr: SocketAddr, message: &ServerMessage) {
+    if let Err(error) = socket.send_to(message.encode().as_bytes(), client_addr) {
+        log::warn!("failed to reply to {client_addr}: {error}");
     }
 }
