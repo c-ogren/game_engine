@@ -12,3 +12,4 @@ protocol = { path = "../protocol" }
 render = { path = "../render" }
 crossterm = { workspace = true }
 anyhow = { workspace = true }
+bevy = "0.19.0"

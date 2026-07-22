@@ -13,6 +13,7 @@
 //! re-printed on every tick received.
 
 use anyhow::{Context, Result, bail};
+use bevy::prelude::*;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     terminal::{disable_raw_mode, enable_raw_mode},
@@ -81,7 +82,38 @@ impl Toasts {
     }
 }
 
+fn setup(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    // Camera
+    commands.spawn((
+        Camera3d::default(),
+        Transform::from_xyz(0.0, 1.5, 5.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+
+    // Light
+    commands.spawn((PointLight::default(), Transform::from_xyz(4.0, 8.0, 4.0)));
+
+    // Cube
+    commands.spawn((
+        Mesh3d(meshes.add(Cuboid::default())),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.8, 0.7, 0.6),
+            ..default()
+        })),
+        Transform::from_xyz(0.0, 0.5, 0.0),
+    ));
+}
+
 fn main() -> Result<()> {
+    // BEVY ATTEMPT
+    App::new()
+        .add_plugins(DefaultPlugins)
+        .add_systems(Startup, setup)
+        .run();
+
     let mut args = env::args().skip(1);
     let (tcp_addr, udp_addr) = match (args.next(), args.next()) {
         (Some(tcp), Some(udp)) => (tcp, udp),
@@ -253,7 +285,7 @@ fn receive_updates(socket: UdpSocket, toasts: Arc<Toasts>, latency: Arc<AtomicU6
 
                 match latency.load(Ordering::Relaxed) {
                     0 => lines.push("Ping: --".to_owned()),
-                    micros => lines.push(format!("Ping: {:.1} ms", micros as f64 / 1000.0)),
+                    micros => lines.push(format!("Ping: {} ms", micros as f64 / 1000.0)),
                 }
 
                 lines.push(format!("Entities in world: {}", entities.len()));
