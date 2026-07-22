@@ -14,3 +14,4 @@ hecs = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
 simplelog = { workspace = true }
+dotenvy = { workspace = true }
